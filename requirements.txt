@@ -1,0 +1,4 @@
+optbinning
+duckdb
+prettytable
+pandas
