@@ -1,0 +1,578 @@
+"""
+Strategic Segmentation & Scorecard Engine
+=========================================
+Combinatorial heuristic segmentation using Optimal Binning, Apriori pruning, 
+and vectorized DuckDB scorecard deciling.
+
+Author: Bishwarup Biswas + Gemini Pro
+Python Version: 3.9+
+"""
+
+import json
+import logging
+import multiprocessing
+import re
+from itertools import combinations
+from typing import Any, Dict, List, Optional, Tuple, Union
+
+import duckdb
+import numpy as np
+import pandas as pd
+from joblib import Parallel, delayed
+from optbinning import OptimalBinning
+
+# Configure Production Module Logger
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)-8s | [%(filename)s:%(lineno)d] | %(message)s",
+)
+logger = logging.getLogger("StrategicEngine")
+
+# Pre-compile regex at module load for O(1) lookup inside loops
+_BRACKET_REGEX = re.compile(r"\[(.*)\]")
+
+
+class StrategicSegmentBuilder:
+    """Extracts mutually exclusive, predictive segments from tabular data.
+
+    Utilizes Optimal Binning to discretize continuous features into monotonic
+    Information Value (IV) bins, applying an Apriori-style combinatorial prune
+    to surface multi-way rules meeting defined Lift and Volume thresholds.
+
+    Attributes:
+        target: Dependent binary target column name (1 = Event, 0 = Non-Event).
+        n_jobs: Number of CPU cores allocated to parallelized search jobs.
+        min_sample_size: Absolute minimum row count required for a valid rule.
+        min_lift: Minimum lift cutoff (Segment Rate / Population Base Rate).
+        top_n_vars: Number of highest-IV features passed into the Apriori engine.
+        max_segments: Hard stopping ceiling for extracted mutually exclusive segments.
+        enable_diversity: If True, blocks rules combining variables from the same business group.
+        enable_1way: Allow 1-dimensional rules in final pool.
+        enable_2way: Allow 2-dimensional intersection rules in final pool.
+        enable_3way: Allow 3-dimensional intersection rules in final pool.
+        feature_groups: Mapping of business categories to columns (e.g. {'risk': ['scr', 'bal']}).
+        ignore_features: Explicit list of columns to drop prior to IV calculation.
+    """
+
+    def __init__(
+        self,
+        target: str,
+        n_jobs: int = -1,
+        min_sample_size: int = 1000,
+        min_lift: float = 2.0,
+        top_n_vars: int = 20,
+        max_segments: int = 10,
+        enable_diversity: bool = False,
+        enable_1way: bool = True,
+        enable_2way: bool = True,
+        enable_3way: bool = True,
+        feature_groups: Optional[Dict[str, List[str]]] = None,
+        ignore_features: Optional[List[str]] = None,
+    ) -> None:
+        self.target = target
+        self.n_jobs = (
+            n_jobs if n_jobs != -1 else max(1, multiprocessing.cpu_count() - 1)
+        )
+        self.min_sample_size = min_sample_size
+        self.min_lift = min_lift
+        self.top_n_vars = top_n_vars
+        self.max_segments = max_segments
+        self.segments: List[Dict[str, Any]] = []
+
+        self.enable_diversity = enable_diversity
+        self.enable_1way = enable_1way
+        self.enable_2way = enable_2way
+        self.enable_3way = enable_3way
+        self.feature_groups = feature_groups or {}
+        self.ignore_features = ignore_features or []
+
+    @staticmethod
+    def _resolve_optb_dtype(series: pd.Series) -> str:
+        """Determines the correct OptBinning data type flag for a Pandas Series."""
+        if str(series.dtype) in ["object", "category", "string", "str"]:
+            return "categorical"
+        return "numerical"
+
+    @staticmethod
+    def _is_numeric_string(val: str) -> bool:
+        """Safely evaluates if a raw string represents a float/int (handles scientific notation)."""
+        try:
+            float(val)
+            return True
+        except ValueError:
+            return False
+
+    def _validate_feature_groups(self, df: pd.DataFrame) -> None:
+        """Validates that all declared feature group variables exist in the target DataFrame."""
+        if not self.feature_groups:
+            return
+
+        active_cols = set(df.columns) - {self.target} - set(self.ignore_features)
+        validated_count = 0
+
+        for group, vars_list in self.feature_groups.items():
+            for var in vars_list:
+                if var not in active_cols:
+                    raise ValueError(
+                        f"Schema Mismatch: Feature '{var}' declared in group '{group}' "
+                        "was not found in the provided DataFrame."
+                    )
+                validated_count += 1
+
+        logger.info(
+            f"Feature group validation passed. ({validated_count} features mapped)"
+        )
+
+    def get_group(self, var: str) -> str:
+        """Returns the assigned business category for a feature, or the feature name itself."""
+        for group, vars_list in self.feature_groups.items():
+            if var in vars_list:
+                return group
+        return var
+
+    def is_diverse(self, combo: Tuple[str, ...]) -> bool:
+        """Ensures a tuple of features spans strictly distinct analytical groups."""
+        if not self.enable_diversity:
+            return True
+        groups = [self.get_group(v) for v in combo]
+        return len(groups) == len(set(groups))
+
+    def compute_iv_ranking(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Calculates Information Value (IV) for all eligible features."""
+
+        def _worker(col: str) -> Dict[str, Union[str, float]]:
+            try:
+                dtype = self._resolve_optb_dtype(df[col])
+                optb = OptimalBinning(name=col, dtype=dtype)
+                optb.fit(df[col].values, df[self.target].values)
+                iv_val = optb.binning_table.build().IV.iloc[-1]
+                return {"variable": col, "iv": float(iv_val) * 100}
+            except Exception as e:
+                logger.debug(f"IV computation failed for {col}: {e}")
+                return {"variable": col, "iv": 0.0}
+
+        eligible_cols = [
+            c for c in df.columns if c != self.target and c not in self.ignore_features
+        ]
+        results = Parallel(n_jobs=self.n_jobs)(
+            delayed(_worker)(col) for col in eligible_cols
+        )
+
+        return (
+            pd.DataFrame(results)
+            .sort_values("iv", ascending=False)
+            .reset_index(drop=True)
+        )
+
+    def create_binned_df(
+        self, df: pd.DataFrame, variables: List[str]
+    ) -> pd.DataFrame:
+        """Transforms continuous data into discrete optimal binned strings."""
+        binned_df = pd.DataFrame(index=df.index)
+
+        for col in variables:
+            dtype = self._resolve_optb_dtype(df[col])
+            optb = OptimalBinning(name=col, dtype=dtype)
+            optb.fit(df[col].values, df[self.target].values)
+
+            transformed_bins = optb.transform(df[col], metric="bins")
+            binned_df[col] = pd.Categorical(transformed_bins)
+
+        binned_df[self.target] = df[self.target].values
+        return binned_df
+
+    def _agg_combinations(
+        self,
+        binned_df: pd.DataFrame,
+        combo_list: List[Tuple[str, ...]],
+        base_rate: float,
+    ) -> pd.DataFrame:
+        """Parallelized aggregation testing feature combinations against thresholds."""
+
+        def _process_combo(combo: Tuple[str, ...]) -> Optional[pd.DataFrame]:
+            summary = (
+                binned_df.groupby(list(combo), observed=True)
+                .agg(count=(self.target, "size"), events=(self.target, "sum"))
+                .reset_index()
+            )
+
+            summary = summary[summary["count"] >= self.min_sample_size].copy()
+            if summary.empty:
+                return None
+
+            summary["rate"] = (summary["events"] / summary["count"]) * 100.0
+            summary["lift"] = summary["rate"] / (base_rate * 100.0)
+
+            summary = summary[summary["lift"] >= self.min_lift]
+            if summary.empty:
+                return None
+
+            # Optimized string join over loop concatenation
+            rule_expressions = [f"{col}={summary[col].astype(str)}" for col in combo]
+            summary["rule"] = summary.apply(
+                lambda row: " & ".join([f"{c}={row[c]}" for c in combo]), axis=1
+            )
+            summary["combo_vars"] = [combo] * len(summary)
+
+            return summary[["rule", "count", "rate", "lift", "combo_vars"]]
+
+        results = Parallel(n_jobs=self.n_jobs)(
+            delayed(_process_combo)(c) for c in combo_list
+        )
+        valid_results = [r for r in results if r is not None]
+
+        return (
+            pd.concat(valid_results, ignore_index=True)
+            if valid_results
+            else pd.DataFrame()
+        )
+
+    def parse_rule_to_sql(self, rule_str: str) -> str:
+        """Translates OptBinning string syntax into a production SQL WHERE clause."""
+        parts = [p.strip() for p in rule_str.split("&")]
+        sql_conditions: List[str] = []
+
+        for part in parts:
+            if "=" not in part:
+                continue
+
+            col, interval = [x.strip() for x in part.split("=", 1)]
+            bracket_match = _BRACKET_REGEX.search(interval)
+
+            is_categorical = False
+            if bracket_match:
+                content = bracket_match.group(1)
+                if any(
+                    k in interval for k in ("'", '"', "Array", "Categorical")
+                ) or not interval.startswith(("[", "(")):
+                    is_categorical = True
+                elif len(content.split(",")) > 2:
+                    is_categorical = True
+
+            # 1. Categorical Set Handling
+            if is_categorical and bracket_match:
+                raw_items = [
+                    i.strip().strip("'").strip('"')
+                    for i in bracket_match.group(1).split(",")
+                    if i.strip()
+                ]
+                formatted_items = ", ".join(
+                    [
+                        item if self._is_numeric_string(item) else f"'{item}'"
+                        for item in raw_items
+                    ]
+                )
+                sql_conditions.append(f"{col} IN ({formatted_items})")
+                continue
+
+            # 2. Null/Special State Handling
+            if interval in ["Special", "Missing"]:
+                sql_conditions.append(f"{col} IS NULL")
+                continue
+
+            # 3. Continuous Numeric Range Handling
+            if interval.startswith(("[", "(")):
+                left_char, right_char = interval[0], interval[-1]
+                lower_str, upper_str = [x.strip() for x in interval[1:-1].split(",", 1)]
+
+                range_conds = []
+                if lower_str.lower() != "-inf":
+                    op = ">=" if left_char == "[" else ">"
+                    range_conds.append(f"{col} {op} {lower_str}")
+
+                if upper_str.lower() != "inf":
+                    op = "<=" if right_char == "]" else "<"
+                    range_conds.append(f"{col} {op} {upper_str}")
+
+                if range_conds:
+                    sql_conditions.append(" AND ".join(range_conds))
+
+        return " AND ".join(
+            f"({cond})" if "AND" in cond else cond for cond in sql_conditions
+        )
+
+    def extract_segments(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Sequentially extracts high-lift segments, pruning captured rows per iteration."""
+        if self.enable_diversity:
+            self._validate_feature_groups(df)
+
+        current_df = df.copy()
+
+        for i in range(1, self.max_segments + 1):
+            base_rate = current_df[self.target].mean()
+            if base_rate == 0 or len(current_df) < self.min_sample_size:
+                break
+
+            logger.info(
+                f"Iteration {i} | Remaining Volume: {len(current_df):,} | Base Rate: {base_rate*100:.2f}%"
+            )
+
+            iv_ranking = self.compute_iv_ranking(current_df)
+            top_vars = iv_ranking.head(self.top_n_vars)["variable"].tolist()
+            binned_df = self.create_binned_df(current_df, top_vars)
+
+            # Prevent uninformative single-bin distributions from polluting n-way space
+            valid_vars = [v for v in top_vars if binned_df[v].nunique() > 1]
+            all_rules: List[pd.DataFrame] = []
+
+            # Apriori Level 1 (Singles)
+            res_1 = self._agg_combinations(
+                binned_df, [(c,) for c in valid_vars], base_rate
+            )
+            valid_1way_vars = set()
+
+            if not res_1.empty:
+                valid_1way_vars = {c[0] for c in res_1["combo_vars"]}
+                if self.enable_1way:
+                    all_rules.append(res_1)
+
+            if not valid_1way_vars:
+                logger.warning(
+                    "Zero features cleared single-variable pruning thresholds. Aborting search."
+                )
+                break
+
+            # Apriori Level 2 (Pairs)
+            valid_2way_sets = set()
+            if len(valid_1way_vars) >= 2 and (self.enable_2way or self.enable_3way):
+                combos_2 = [
+                    c for c in combinations(valid_1way_vars, 2) if self.is_diverse(c)
+                ]
+                if combos_2:
+                    res_2 = self._agg_combinations(binned_df, combos_2, base_rate)
+                    if not res_2.empty:
+                        valid_2way_sets = {frozenset(c) for c in res_2["combo_vars"]}
+                        if self.enable_2way:
+                            all_rules.append(res_2)
+
+            # Apriori Level 3 (Triplets)
+            if self.enable_3way and len(valid_1way_vars) >= 3 and valid_2way_sets:
+                combos_3 = [
+                    c
+                    for c in combinations(valid_1way_vars, 3)
+                    if self.is_diverse(c)
+                    and all(
+                        frozenset(p) in valid_2way_sets for p in combinations(c, 2)
+                    )
+                ]
+                if combos_3:
+                    res_3 = self._agg_combinations(binned_df, combos_3, base_rate)
+                    if not res_3.empty:
+                        all_rules.append(res_3)
+
+            if not all_rules:
+                logger.info("No active candidates cleared criteria pool. Stopping.")
+                break
+
+            shortlisted = (
+                pd.concat(all_rules, ignore_index=True)
+                .sort_values(["lift", "rate", "count"], ascending=False)
+                .reset_index(drop=True)
+            )
+
+            best_rule = shortlisted.loc[0, "rule"]
+            best_sql = self.parse_rule_to_sql(best_rule)
+
+            self.segments.append(
+                {
+                    "segment_id": i,
+                    "rule_string": best_rule,
+                    "sql_filter": best_sql,
+                    "count": int(shortlisted.loc[0, "count"]),
+                    "rate": float(shortlisted.loc[0, "rate"]),
+                    "lift": float(shortlisted.loc[0, "lift"]),
+                }
+            )
+
+            logger.info(f"Segment {i} Captured: {best_sql}")
+            # DuckDB dynamically scans current_df locally
+            current_df = duckdb.query(
+                f"SELECT * FROM current_df WHERE NOT ({best_sql})"
+            ).df()
+
+        return pd.DataFrame(self.segments)
+
+    def evaluate_final_coverage(self, original_df: pd.DataFrame) -> pd.DataFrame:
+        """Executes a full CASE WHEN query over the source dataset to map mutually exclusive coverage."""
+        if not self.segments:
+            return pd.DataFrame()
+
+        case_statements = [
+            f"WHEN {seg['sql_filter']} THEN {seg['segment_id']}"
+            for seg in self.segments
+        ]
+        case_sql = "\n                ".join(case_statements)
+
+        final_query = f"""
+        WITH PER_SEG_KPIS AS (
+            SELECT 
+                CASE {case_sql} ELSE 0 END AS segment, 
+                COUNT(*) AS total_count,
+                SUM("{self.target}") AS target_events,
+                (SUM("{self.target}") * 100.0 / COUNT(*)) AS response_rate
+            FROM original_df
+            GROUP BY 1
+        ),
+        BASE_KPIS AS (
+            SELECT *,
+                SUM(total_count) OVER() AS total_population,
+                (SUM(target_events) OVER() * 1.0 / SUM(total_count) OVER()) * 100 AS base_response_rate 
+            FROM PER_SEG_KPIS
+        )
+        SELECT 
+            PER_SEG_KPIS.*, 
+            BASE_KPIS.base_response_rate,
+            (PER_SEG_KPIS.total_count * 1.0 / BASE_KPIS.total_population) * 100 AS capture_rate,
+            (PER_SEG_KPIS.response_rate / BASE_KPIS.base_response_rate) AS lift
+        FROM PER_SEG_KPIS
+        LEFT JOIN BASE_KPIS ON PER_SEG_KPIS.segment = BASE_KPIS.segment
+        ORDER BY segment
+        """
+        return duckdb.query(final_query).df()
+
+
+class StrategicSegmentScore:
+    """High-Throughput Vectorized Scorecard Engine.
+
+    Computes segment weights via Harmonic Mean and applies dot-product deciling
+    over large datasets using optimized DuckDB aggregations and NumPy BLAS operations.
+    """
+
+    def __init__(
+        self, target_col: str, primary_key: str, segment_cols: List[str]
+    ) -> None:
+        self.target_col = target_col
+        self.primary_key = primary_key
+        self.segment_cols = segment_cols
+        self.model_artifact: Dict[str, Any] = {}
+
+    def calculate_and_export_weights(
+        self, df: pd.DataFrame, export_path: str = "scorecard_model.json"
+    ) -> Dict[str, Any]:
+        """Calculates harmonic weights and derives decile boundaries via vectorized execution."""
+        logger.info(f"Initializing DuckDB scorecard engine for {len(df):,} records...")
+
+        ctx = duckdb.connect()
+
+        # Step 1: Baseline metrics + Vectorized multi-segment aggregation (O(1) Scan)
+        agg_expressions = [
+            f'COUNT(CASE WHEN "{col}" = 1 THEN 1 END) AS "{col}_cnt", '
+            f'SUM(CASE WHEN "{col}" = 1 THEN "{self.target_col}" ELSE 0 END) AS "{col}_ev"'
+            for col in self.segment_cols
+        ]
+
+        master_sql = f"""
+            SELECT 
+                COUNT(*) AS total_pop, 
+                SUM("{self.target_col}") AS total_ev,
+                {', '.join(agg_expressions)}
+            FROM df
+        """
+
+        master_res = ctx.execute(master_sql).fetchone()
+        if not master_res:
+            raise RuntimeError("Database engine failed to return aggregations.")
+
+        total_population, total_events = master_res[0], master_res[1]
+
+        if total_population == 0 or total_events == 0:
+            raise ValueError(
+                "Invalid Dataset: Population and total events must be greater than zero."
+            )
+
+        baseline_rate = total_events / total_population
+        zero_inflation_rate = 1.0 - baseline_rate
+
+        # Step 2: Unpack vectorized SQL aggregations into weight lookup
+        logger.info("Computing harmonic scorecard weights...")
+        weights_lookup: Dict[str, Dict[str, Union[int, float]]] = {}
+
+        for idx, seg_col in enumerate(self.segment_cols):
+            # Unpack the specific column offsets from the single master tuple
+            seg_count = master_res[2 + (idx * 2)] or 0
+            seg_events = master_res[2 + (idx * 2) + 1] or 0
+
+            if seg_count == 0 or seg_events == 0:
+                logger.warning(
+                    f"Segment '{seg_col}' has zero volume or events. Setting weight=0."
+                )
+                weights_lookup[seg_col] = {
+                    "weight": 0,
+                    "lift": 0.0,
+                    "response_rate": 0.0,
+                    "capture_rate": 0.0,
+                }
+                continue
+
+            response_rate = seg_events / seg_count
+            capture_rate = seg_events / total_events
+            lift = response_rate / baseline_rate
+
+            harmonic_mean = 2 * (
+                (response_rate * capture_rate) / (response_rate + capture_rate)
+            )
+            raw_weight = lift * harmonic_mean * 100.0
+
+            weights_lookup[seg_col] = {
+                "weight": int(np.round(raw_weight)),
+                "lift": round(lift, 4),
+                "response_rate": round(response_rate, 4),
+                "capture_rate": round(capture_rate, 4),
+            }
+
+        # Step 3: BLAS Matrix Dot-Product Scoring
+        logger.info("Scoring training dataset via NumPy Linear Algebra engine...")
+        scored_cols = list(weights_lookup.keys())
+        weights_vector = np.array(
+            [weights_lookup[c]["weight"] for c in scored_cols], dtype=np.float64
+        )
+
+        # df[cols] @ weights_vector runs at raw C speed
+        train_scores = (
+            df[scored_cols].to_numpy(dtype=np.float64) @ weights_vector
+        )
+
+        logger.info(f"Dataset Zero-Inflation Rate: {zero_inflation_rate:.2%}")
+
+        if zero_inflation_rate >= 0.80:
+            logger.info("High Zero-Inflation (>=80%). Isolating Active Population...")
+            active_scores = train_scores[train_scores > 0]
+        else:
+            logger.info("Normal Distribution (<80%). Deciling across full dataset...")
+            active_scores = train_scores
+
+        if len(active_scores) == 0:
+            raise ValueError(
+                "Scorecard Failure: 0 customers triggered any segment rules."
+            )
+
+        # Step 4: High-speed NumPy sorting over Pandas Series
+        logger.info(
+            f"Calibrating deciles across {len(active_scores):,} target customers..."
+        )
+        sorted_scores = np.sort(active_scores)[::-1]
+        active_pop_size = len(sorted_scores)
+
+        decile_thresholds: Dict[str, int] = {}
+        for d in range(1, 11):
+            row_idx = int((d / 10.0) * active_pop_size) - 1
+            row_idx = max(0, min(active_pop_size - 1, row_idx))
+            decile_thresholds[str(d)] = int(sorted_scores[row_idx])
+
+        self.model_artifact = {
+            "model_metadata": {
+                "total_training_population": int(total_population),
+                "active_scored_population": int(active_pop_size),
+                "active_population_pct": round(
+                    (active_pop_size / total_population) * 100.0, 2
+                ),
+                "baseline_event_rate": round(baseline_rate, 4),
+            },
+            "segment_weights": weights_lookup,
+            "decile_min_thresholds": decile_thresholds,
+        }
+
+        with open(export_path, "w", encoding="utf-8") as f:
+            json.dump(self.model_artifact, f, indent=4)
+
+        return self.model_artifact
