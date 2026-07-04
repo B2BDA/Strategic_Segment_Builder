@@ -2,3 +2,5 @@ optbinning
 duckdb
 prettytable
 pandas
+pyarrow
+openpyxl

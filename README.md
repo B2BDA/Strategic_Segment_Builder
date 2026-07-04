@@ -1,237 +1,331 @@
-# Strategic Segment Builder (SSB)
+# Strategic Segmentation & Scorecard Engine
 
-A combinatorial heuristic engine for extracting highly predictive, mutually exclusive segments from tabular data using Optimal Binning and Apriori-style pruning.
+A high-performance, industrial-grade combinatorial heuristic engine and scoring framework for extracting highly predictive, mutually exclusive segments from tabular data and compiling them into optimized financial scorecards.
 
 ---
 
 ## 1. Executive Summary
 
 ### WHAT is it?
-The **Strategic Segment Builder (SSB)** is an automated rule-induction engine designed to search through large feature spaces to find high-performing, distinct, and statistically reliable sub-populations (segments) within a dataset. Instead of identifying broad trends, SSB extracts precise multidimensional rules—such as:
-`utilization_avg_3m >= 0.84 AND max_dpd_12m >= 36.09 AND risk_segment IN ('HighRisk')`
+The **Strategic Segmentation & Scorecard Engine** is an automated framework designed to solve two core challenges in predictive analytics: discovering high-performing sub-populations (segments) within large feature spaces and compiling those segments into highly optimized, production-ready linear scoring models. 
+
+It is divided into two decoupled, synergistic modules:
+1. **`StrategicSegmentBuilder`**: Searches feature combinations using an Apriori-inspired pruning technique and an exhaustive multi-threshold grid search to extract precise, non-overlapping rule conditions.
+2. **`StrategicSegmentScore`**: Converts those rules into a vectorized scoring model by computing harmonic feature weights, executing ultra-fast linear algebra transformations, calibrating decile distributions, and exporting the results into a lightweight JSON artifact.
 
 ### WHY do we need it?
-In risk management, marketing analytics, and fraud detection, identifying specific risk pockets or high-value customer clusters usually demands extensive manual profiling, subjective visual binning, and trial-and-error. 
-* **The Rules Engine Pitfall:** Manual exploration frequently misses non-linear intersections of three or more variables, or it accidentally creates overlapping rules where a single customer qualifies for multiple segments.
-* **The Machine Learning Pitfall:** While black-box models (e.g., XGBoost, LightGBM) surface these patterns automatically, they cannot be natively translated into transparent, hard-coded SQL expressions required by production billing or legacy credit decisioning engines.
-* **The Solution:** SSB bridges this gap by combining the automated discovery power of algorithmic optimization with the absolute transparency of pure SQL logical outputs.
+In risk management, fraud detection, and marketing analytics, engineering transparent models usually forces teams into a difficult trade-off:
+* **The Machine Learning Pitfall**: Black-box models (e.g., XGBoost, LightGBM) surface multi-way feature interactions automatically but cannot be natively translated into transparent, hard-coded SQL logic required by legacy transaction rules engines.
+* **The Manual Profiling Pitfall**: Manual segmentation misses non-linear intersections of three or more variables, risks severe over-fitting on small sample sizes, and frequently creates overlapping conditions where a single record qualifies for multiple rules.
+* **The Solution**: This framework bridges the gap by combining the automated discovery power of multi-threaded algorithmic search with the execution speeds of **DuckDB** and **NumPy BLAS operations**, outputting pure ANSI SQL text filters and robust linear scorecards.
 
 ### HOW does it work?
-The engine runs recursively in a five-stage loop:
-1. **Rank Feature Significance:** Uses Information Value (IV) to surface individual features with the highest correlation to your target variable.
-2. **Optimal Discretization:** Groups continuous metrics into optimal categorical bins using the `OptimalBinning` framework.
-3. **Combinatorial Search:** Pairs and triplets features using an Apriori heuristic to see if their intersection yields a massive spike in predictive power (Lift).
-4. **Isolate and Extract:** Selects the single strongest rule, translates it instantly into production-ready SQL, and commits it to the segment array.
-5. **Deduplicate Pool:** Leverages an in-memory SQL layer (`duckdb`) to remove the matching records entirely, ensuring that subsequent iterations evaluate only clean, unsegmented data to enforce absolute mutual exclusivity.
+The engine runs recursively through an analytical lifecycle:
+1. **Rank Feature Significance**: Uses Information Value (IV) calculated via optimal discretization to isolate and surface the top predictive columns.
+2. **Combinatorial Grid Search**: Pairs and triplets features using an Apriori heuristic across a hyperparameter grid of sample sizes and lift limits to find highly predictive intersections.
+3. **Isolate and Deduplicate**: Selects the single strongest multi-way rule, translates it into production-ready SQL, and extracts the matching records using an in-memory SQL layer (`duckdb`) to guarantee absolute mutual exclusivity for subsequent iterations.
+4. **Vectorized Weight Calculation**: Performs an O(1) table scan across the final rule cohort matrix to compute segment weights using actual lift scaled by an optimized harmonic mean formulation.
+5. **BLAS Execution & Model Export**: Multiplies the resulting sparse input arrays against the weight vector at raw C speeds using a matrix dot-product, calibrates score deciles, and flushes the parameters to a standardized JSON schema.
 
 ---
 
-## 2. Statistical Foundation: WOE & IV
+## 2. Statistical & Weighting Foundations
 
-Before evaluating multidimensional intersections, the engine measures individual features using two core credit-scoring metrics: **Weight of Evidence (WOE)** and **Information Value (IV)**.
+### 1. Feature Profiling: WOE & IV
+Before evaluating multi-way intersections, the engine filters individual continuous and categorical features using **Weight of Evidence (WOE)** and **Information Value (IV)**.
 
-* **WOE (Weight of Evidence):** Measures the predictive power of a specific bin relative to the overall population. It quantifies how much a given value shifts the log-odds of an event occurring.
-* **IV (Information Value):** Summarizes the overall predictive power of the *entire variable* across all its bins.
+* **WOE (Weight of Evidence)**: Measures the predictive power of an individual bin relative to the overall baseline population. It establishes how much a specific value band shifts the log-odds of an event occurring:
+  $$WOE = \ln \left( \frac{\text{Percent of Non-Events}}{\text{Percent of Events}} \right)$$
+* **IV (Information Value)**: Summarizes the overall predictive power of the entire variable across all its discrete bins:
+  $$IV = \sum \left( \text{Percent of Non-Events} - \text{Percent of Events} \right) \times WOE$$
 
-### Mathematical Formulas
-$$ WOE = ln \\Bigg(\\frac{\\text{percent of non-events}}{\\text{percent of events}}\\Bigg)$$
-
-IV = ∑ (% of non-events - % of events) * WOE
-### Step-by-Step Working Example
-Let's trace how the engine handles a single continuous variable, **`utilization_avg_3m`**, against a binary target where `1 = Default (Event)` and `0 = Good (Non-Event)`.
-
-#### 1. Raw Distribution Data
-Given a baseline population of **10,000 customers** (8,000 Goods / 2,000 Defaults), the optimization layer cuts the continuous variable into three distinct bins:
-
-| Bin (Utilization Range) | Non-Events (Goods) | Events (Defaults) | Total Count |
-| :--- | :---: | :---: | :---: |
-| **Low** `[0.00, 0.40)` | 5,000 | 300 | 5,300 |
-| **Mid** `[0.40, 0.84)` | 2,500 | 700 | 3,200 |
-| **High** `[0.84, inf)` | 500 | 1,000 | 1,500 |
-| **Total Baseline** | **8,000** | **2,000** | **10,000** |
-
-#### 2. Convert Counts to Distribution Percentages
-* **Low Bin [0.00, 0.40):**
-  * Non-Event Distribution = 5,000 / 8,000 = 0.625 (62.5%)
-  * Event Distribution = 300 / 2,000 = 0.150 (15.0%)
-* **High Bin [0.84, inf):**
-  * Non-Event Distribution = 500 / 8,000 = 0.0625 (6.25%)
-  * Event Distribution = 1,000 / 2,000 = 0.500 (50.0%)
-
-#### 3. Calculate Weight of Evidence (WOE)
-* **Low Bin WOE:** ln(0.625 / 0.150) = ln(4.167) = +1.427 (Positive WOE indicates lower risk)
-* **High Bin WOE:** ln(0.0625 / 0.500) = ln(0.125) = -2.079 (Negative WOE indicates elevated risk)
-
-#### 3. Calculate Weight of Evidence (WOE)
-* **Low Bin WOE:** $\ln(0.625 / 0.150) = \ln(4.167) = \mathbf{+1.427}$  *(Positive WOE indicates lower risk)*
-* **High Bin WOE:** $\ln(0.0625 / 0.500) = \ln(0.125) = \mathbf{-2.079}$ *(Negative WOE indicates elevated risk)*
-
-#### 4. Calculate Information Value (IV) Contribution
-* **Low Bin IV:** $(0.625 - 0.150) \times 1.427 = 0.475 \times 1.427 = \mathbf{0.678}$
-* **High Bin IV:** $(0.0625 - 0.500) \times (-2.079) = -0.4375 \times (-2.079) = \mathbf{0.910}$
-
-Summing the IV contributions of all bins yields the variable's total IV. If a variable's total IV exceeds $0.3$, it is flagged as a strong predictor and prioritized during rule induction.
+Variables that yield a total $IV \times 100 > 30.0$ are flagged as strong individual predictors and are automatically prioritized during rule induction loops.
 
 ---
 
-## 3. Algorithmic Design: Apriori vs. Grid Search
+### 2. Scorecard Weight Formulation
+Once rules are finalized, they are passed to the scorecard module as a matrix of binary indicator flags ($1$ if the customer satisfies the rule, $0$ otherwise). The engine calculates the mathematical weight for each segment using a combination of **Lift** and the **Harmonic Mean of Response and Capture Rates**.
 
-Evaluating multidimensional intersections across many variables can easily lead to a combinatorial explosion. SSB overcomes this bottleneck by applying a modified **Apriori pruning technique**.
+For a given segment $s$:
+* **Response Rate ($RR_s$)**: $\frac{\text{Events}_s}{\text{Total Count}_s}$
+* **Capture Rate ($CR_s$)**: $\frac{\text{Events}_s}{\text{Total Population Events}}$
+* **Lift ($L_s$)**: $\frac{RR_s}{\text{Baseline Population Event Rate}}$
 
-### Standard Grid Search (Brute Force)
-If you select the top 20 predictive variables and want to evaluate combinations up to 3 dimensions deep, a standard grid search calculates **every single mathematical permutation**:
-* **1-Way Combinations:** 20 checks
-* **2-Way Combinations:** $\binom{20}{2} = 190$ checks
-* **3-Way Combinations:** $\binom{20}{3} = 1,140$ checks
-* **Total Evaluated Configurations:** **1,350 aggregations** *per iteration*.
+The engine derives the balance between structural segment density (capture rate) and vertical risk concentration (response rate) by computing their harmonic mean:
+$$\text{Harmonic Mean}_s = 2 \times \left( \frac{RR_s \times CR_s}{RR_s + CR_s} \right)$$
 
-Performing thousands of multi-key grouping calculations repeatedly over millions of rows causes severe processing delays.
-
-### The Apriori Solution
-The Apriori principle leverages a core pruning property: **If an individual item fails to meet a performance threshold, any higher-order combination containing that item is guaranteed to fail.**
-
-SSB implements this layer step-by-step:
-1. **Level 1 (1-Way):** Group by and test all 20 individual variables against your volume (`min_sample_size`) and risk (`min_lift`) benchmarks. Assume only **6 variables** pass.
-2. **Level 2 (2-Way):** Instead of pairing all 20 initial metrics, the engine **only generates pairs using the 6 surviving variables**. This prunes candidates down from 190 to just $\binom{6}{2} = \mathbf{15}$ pairs. Assume only **4 pairs** pass.
-3. **Level 3 (3-Way):** Instead of testing 1,140 triplets, the engine evaluates only triplets where **all three internal pairs were successful** in Level 2. This narrows the candidate space down to just **2 or 3 highly reliable combinations**.
-
-### Why it Matters:
-* **Computational Efficiency:** Reduces required multi-key aggregations by up to $90\%$, cutting runtimes from hours to seconds.
-* **Anti-Overfitting Guardrails:** Ensures that high-order 3-way interactions reflect robust, scalable interactions rather than random noise in small data subsets.
+This metric is multiplied by the segment's lift and scaled to produce a robust, integer-rounded operational weight:
+$$\text{Raw Weight}_s = L_s \times \text{Harmonic Mean}_s \times 100.0$$
+$$\text{Weight}_s = \lfloor \text{round}(\text{Raw Weight}_s) \rfloor$$
 
 ---
 
-## 4. System Architecture & Process Flow
+### 3. Zero-Inflation & Active Population Calibration
+Real-world behavioral datasets frequently exhibit high zero-inflation, where the vast majority of records fail to trigger any specialized rules.
+
+To prevent highly skewed zero-bins from distorting score calibrations, the engine calculates the dataset's **Zero-Inflation Rate**:
+$$\text{Zero-Inflation Rate} = 1.0 - \text{Baseline Population Event Rate}$$
+
+* **Normal Distribution (< 80% Zero-Inflation)**: If the zero-inflation rate is low, the engine computes decile minimum score thresholds across the entire population.
+* **High Zero-Inflation ($\ge$ 80% Zero-Inflation)**: If the zero-inflation rate meets or exceeds the 80% threshold, the engine automatically runs a NumPy boolean slicing mask to isolate the **Active Population** (`train_scores > 0`). Decile step-boundaries are then calibrated exclusively over this active subgroup, preventing a large block of unsegmented records from flattening the model's risk stratification tiers.
+
+* ## 3. Algorithmic Design: Apriori Pruning & Grid Search
+
+Evaluating multidimensional feature intersections across wide schemas risks severe processing delays and combinatorial explosion. This framework addresses these bottlenecks by pairing a multi-core **Apriori pruning heuristic** with a **Champion-Challenger Grid Search** architecture.
+
+### 1. Apriori-Style Dimensional Pruning
+If you evaluate combinations up to 3 dimensions deep across the top 20 predictive variables, a standard brute-force grid search must calculate every mathematical combination:
+* **1-Way Checks**: 20 aggregations
+* **2-Way Checks**: $\binom{20}{2} = 190$ aggregations
+* **3-Way Checks**: $\binom{20}{3} = 1,140$ aggregations
+* **Total Evaluated Configurations**: **1,350 aggregations** *per iteration*.
+
+The engine cuts down this search space by leveraging the Apriori property: *If a single feature path fails to meet a performance threshold, any higher-order combination containing that path is guaranteed to fail.*
 
 ```text
-       [Tabular Input DataFrame]
-                    │
-                    ▼
-   ┌──────────────────────────────────┐
-   │  Compute Information Value (IV)  │ ◄── Identifies and ranks top features
-   └──────────────────────────────────┘
-                    │
-                    ▼
-   ┌──────────────────────────────────┐
-   │     Optimal Discretization       │ ◄── Drops uninformative single-bin variables
-   └──────────────────────────────────┘
-                    │
-                    ▼
-   ┌──────────────────────────────────┐
-   │    Apriori Heuristic Engine      │
-   │  • Level 1: Find valid base vars │
-   │  • Level 2: Construct valid pairs│ ◄── Prunes invalid search spaces in parallel
-   │  • Level 3: Form valid triplets  │
-   └──────────────────────────────────┘
-                    │
-                    ▼
-   ┌──────────────────────────────────┐
-   │   Rule Selection (Max Lift)      │ ◄── Picks the top performing rule
-   └──────────────────────────────────┘
-                    │
-         ┌──────────┴──────────┐
-         ▼                     ▼
-┌──────────────────┐  ┌──────────────────┐
-│ Parse to Pure    │  │ Slice Out Target │
-│ Production SQL   │  │ Cohort (DuckDB)  │ ◄── Enforces mutual exclusivity
-└──────────────────┘  └──────────────────┘
-                               │
-                               ▼
-                    [Loop to Next Iteration]
+[Top 20 Ranked Features] ──► [Level 1: 1-Way Check] ──► (Only 6 Features Pass Floors)
+                                      │
+                                      ▼
+                             [Level 2: 2-Way Check] ──► (Only pairs formed from those 6 evaluated: 15 pairs)
+                                      │
+                                      ▼
+                             [Level 3: 3-Way Check] ──► (Only triplets where ALL internal pairs passed evaluated)
+```
+This pruning mechanism reduces multi-key grouping evaluations by up to 90%, speeding up execution while ensuring higher-order 3-way rules represent stable, statistically sound relationships rather than random noise in tiny data subsets.
+
+### 2. Multi-Threshold Grid Search
+When extracting rules, the engine natively accepts an execution hyperparameter matrix (param_grid) tracking lists of min_sample_size and min_lift constraints.
+```python
+param_grid = {
+    "min_sample_size": [1000, 5000, 10000], 
+    "min_lift": [1.5, 2.0, 2.5]
+}
+```
+Instead of short-circuiting early or requiring inputs to be sorted from highest to lowest threshold, the engine uses an exhaustive execution lifecycle:  
+1. **Permutation Generation**: It maps every parameter permutation into isolated, independent experiments via itertools.product.
+2. **Exhaustive Evaluation**: For each iteration, it runs the entire multi-level Apriori combination loop for every hyperparameter combination, collecting the top rule that cleared that specific experiment's floor into a master grid_candidates array.
+3. **Global Champion Resolution**: Once all experiments finish, the complete candidate table is sorted globally across all dimensions:
+     ```python
+     grid_results = pd.DataFrame(grid_candidates).sort_values(
+          ["lift", "count", "rate"], ascending=False).reset_index(drop=True)
+     ```
+4. **Winning Extraction**: The record at index zero (iloc[0]) is crowned the absolute champion for that loop. The engine locks in its specific rule, updates feature usage metrics, tracks the applied parameters, and isolates the target cohort.
+---
+* ## 4. System Architecture & Process Flow
+
+```text
+                        [Raw Tabular Dataset Input]
+                                     │
+                                     ▼
+                     ┌───────────────────────────────┐
+                     │ Compute Feature IV Rankings   │
+                     └───────────────────────────────┘
+                                     │
+                                     ▼
+                     ┌───────────────────────────────┐
+                     │  Optimal Monotonic Binning    │
+                     └───────────────────────────────┘
+                                     │
+                    ┌────────────────┴────────────────┐
+                    ▼                                 ▼
+         [Apriori Pruning Layers]          [Multi-Threshold Grid Search]
+         • Level 1: Filter 1-Way Base      • Generates all size/lift combinations
+         • Level 2: Construct 2-Way Pairs  • Runs experiments via parallel loops
+         • Level 3: Form valid triplets    • Gathers candidate rule sets
+                    └────────────────┬────────────────┘
+                                     │
+                                     ▼
+                     ┌───────────────────────────────┐
+                     │ Global Champion Selection     │ ◄── Sorts by actual Lift & Volume
+                     └───────────────────────────────┘
+                                     │
+                    ┌────────────────┴────────────────┐
+                    ▼                                 ▼
+       ┌─────────────────────────┐       ┌─────────────────────────┐
+       │ Parse Rule to Pure SQL  │       │ Residual Filter Block   │
+       │ (IN, AND, Range Clauses)│       │ (DuckDB In-Memory Scan) │
+       └─────────────────────────┘       └─────────────────────────┘
+                                                      │
+                                                      ▼
+                                        [Loop to Next Segment Iteration]
+                                                      │
+                                           (Once Segment Pool completes)
+                                                      │
+                                                      ▼
+                                     ┌───────────────────────────────┐
+                                     │ Scorecard Engine Initialization│
+                                     └───────────────────────────────┐
+                                                      │
+                                                      ▼
+                                     ┌───────────────────────────────┐
+                                     │ Single-Pass DuckDB Aggregation│ ◄── Extracts population/event counts
+                                     └───────────────────────────────┐
+                                                      │
+                                                      ▼
+                                     ┌───────────────────────────────┐
+                                     │ Weight Compilation Matrix     │ ◄── Scaled via Harmonic Mean equations
+                                     └───────────────────────────────┐
+                                                      │
+                                                      ▼
+                                     ┌───────────────────────────────┐
+                                     │ BLAS Matrix Dot-Product Opt   │ ◄── Array @ Vector at raw C speeds
+                                     └───────────────────────────────┐
+                                                      │
+                                                      ▼
+                                     ┌───────────────────────────────┐
+                                     │ Decile Threshold Calibration  │ ◄── Auto-isolates active pop if >= 80%
+                                     └───────────────────────────────┐
+                                                      │
+                                                      ▼
+                                      [Final JSON Model Model Export]
 
 ```
 
-### Execution Detail:
+### Batch 3: Parameter & Attribute Reference
 
-1. **IV Filter:** The engine filters input metrics down to the `top_n_vars` with the strongest predictive power.
-2. **Bin Isolation:** Continuous metrics are transformed into mathematical intervals (e.g., `[0.84, inf)`). Variables that fail to split into at least 2 distinct bins are dropped immediately, preventing non-informative ranges from polluting the pipeline.
-3. **Parallel Evaluation:** Combination candidates are distributed across CPU cores using `joblib` to calculate sample size, event rates, and lift concurrently.
-4. **The Robust SQL Parsing Layer:** An internal regular expression engine parses string array representations (such as `<StringArray>['HighRisk']`) and numeric boundaries, converting raw rules into standardized SQL WHERE clauses: `col IN ('HighRisk')` or `col >= 0.84`.
-5. **Deduplication:** The winning segment's SQL filter is compiled into a destructive elimination query run via `duckdb`:
-`SELECT * FROM current_df WHERE NOT (winning_sql_filter)`
-This updates the data pool in place, ensuring subsequent search loops focus exclusively on the unsegmented population.
-
----
 
 ## 5. Class Attributes & Parameter Reference
 
-### Technical Configuration
+### 1. `StrategicSegmentBuilder`
 
-* **`target`** *(str)*: Name of the dependent binary column (`1` = event, `0` = non-event) you intend to predict or optimize.
-* **`n_jobs`** *(int, default: -1)*: Number of parallel CPU workers used. If set to `-1`, it automatically allocates all available threads minus one (`multiprocessing.cpu_count() - 1`).
+#### Initialization Parameters
+| Parameter | Type | Default | Description |
+| :--- | :--- | :--- | :--- |
+| `target` | `str` | *Required* | Dependent binary target column name (`1` = Event, `0` = Non-Event). |
+| `n_jobs` | `int` | `-1` | CPU threads for parallel processing. `-1` uses `available_cores - 1`. |
+| `min_sample_size` | `int` | `1000` | Absolute minimum record volume floor required to validate a rule. |
+| `min_lift` | `float` | `2.0` | Minimum lift cutoff value ($\text{Segment Rate} / \text{Base Rate}$). |
+| `top_n_vars` | `int` | `20` | Total highest-IV features passed into the combinatorial engine. |
+| `max_segments` | `int` | `10` | Hard stopping ceiling for total extracted mutually exclusive segments. |
+| `max_feature_reuse` | `int` | `1` | Max times an individual feature can appear across all final rules. |
+| `enable_diversity` | `bool` | `False` | If `True`, blocks combinations pairing features within the same business group. |
+| `enable_1way` | `bool` | `True` | Allows or blocks 1-dimensional rules in the final candidate pool. |
+| `enable_2way` | `bool` | `True` | Allows or blocks 2-dimensional intersection rules in the final pool. |
+| `enable_3way` | `bool` | `True` | Allows or blocks 3-dimensional intersection rules in the final pool. |
+| `feature_groups` | `Dict` | `None` | Maps descriptive business category keys to groups of column strings. |
+| `ignore_features` | `List` | `None` | Explicit list of metadata columns to drop before running processing steps. |
 
-### Rule & Heuristic Constraints
-
-* **`min_sample_size`** *(int, default: 1000)*: Minimum row count required to validate a segment. Stops the engine from generating fragile micro-segments.
-* **`min_lift`** *(float, default: 2.0)*: Minimum lift threshold required for a rule to be considered. Calculated as: $\text{Segment Rate} / \text{Baseline Population Rate}$.
-* **`top_n_vars`** *(int, default: 20)*: Maximum number of high-IV features selected during each iteration. Caps computational complexity.
-* **`max_segments`** *(int, default: 10)*: Maximum number of sequential, mutually exclusive segments the engine will extract before halting.
-
-### Dimensional Controls
-
-* **`enable_1way`** *(bool, default: True)*: Allows or restricts single-variable segment generation.
-* **`enable_2way`** *(bool, default: True)*: Allows or restricts two-variable interaction segment generation.
-* **`enable_3way`** *(bool, default: True)*: Allows or restricts three-variable interaction segment generation.
-
-### Domain Knowledge Controls
-
-* **`feature_groups`** *(Dict[str, List[str]], default: None)*: Optional dictionary categorizing raw columns into distinct business categories.
-* *Example:* `{'liquidity': ['bal_1m', 'bal_3m'], 'delinquency': ['pay_0', 'max_dpd_12m']}`
-
-
-* **`enable_diversity`** *(bool, default: False)*: When set to `True` (and given `feature_groups`), prevents multidimensional rules from using features within the same group. This forces the search engine to mix different analytical dimensions (e.g., combining a delinquency feature with a liquidity feature rather than pairing two highly correlated delinquency metrics).
+#### Generated Output Fields (Segment Dataframe)
+* **`segment_id`**: Sequential iteration integer index.
+* **`rule_string`**: Raw rule syntax returned by the OptBinning transformation layer.
+* **`sql_filter`**: Standardized production-ready ANSI SQL WHERE clause condition.
+* **`count`**: Actual volume of records matching the rule criteria.
+* **`rate`**: Internal event frequency percentage observed inside the segment.
+* **`lift`**: Calculated performance lift multiplier relative to the global population rate.
+* **`meta_applied_sample_size`**: The specific `min_sample_size` parameter that captured the winning rule.
+* **`meta_applied_min_lift`**: The specific `min_lift` parameter that captured the winning rule.
 
 ---
 
+### 2. `StrategicSegmentScore`
+
+#### Initialization Parameters
+| Parameter | Type | Description |
+| :--- | :--- | :--- |
+| `target_col` | `str` | Name of the dependent binary target column (`1` = Event, `0` = Non-Event). |
+| `primary_key` | `str` | Row-level tracking key or transaction sequence identifier string. |
+| `segment_cols` | `List[str]` | List of compiled binary segment indicator columns ($1$ or $0$) to build into the scorecard. |
+
+#### Exported JSON Model Artifact Schema
+* **`model_metadata`**: Holds population execution records (`total_training_population`, `active_scored_population`, `active_population_pct`, `baseline_event_rate`).
+* **`segment_weights`**: Nested dictionary mapping each column to its `weight`, `lift`, `response_rate`, and `capture_rate`.
+* **`decile_min_thresholds`**: Dictionary mapping decile levels (`"1"` to `"10"`) to their corresponding integer score cutoffs.
+
 ## 6. Quick Start Guide
 
-### Installation (Coming soon..........)
-
-```bash
-pip install strategic-segment-builder
-
-```
-
-### Basic Usage Example
+This guide demonstrates an end-to-end analytical pipeline: extracting rules across a hyperparameter grid, evaluating cascading database coverage, generating binary indicator flags, and building an optimized scorecard.
 
 ```python
+import numpy as np
 import pandas as pd
-from strategic_segment_builder import StrategicSegmentBuilder
+from SSB_2 import StrategicSegmentBuilder, StrategicSegmentScore
 
-# 1. Load your raw transactional or analytical data
-df = pd.read_csv("credit_risk_dataset.csv")
+# 1. Generate Synthetic Tabular Transaction Pool for Verification
+np.random.seed(42)
+n_records = 50000
 
-# 2. Define business groups (Optional)
-groups = {
-    "delinquency_vars": ["dpd_avg_3m", "dpd_avg_6m", "dpd_avg_12m", "max_dpd_12m"],            
-    "transaction_vars": ["txn_count_avg_3m", "txn_count_avg_6m", "txn_count_avg_12m"],
-    "spend_vars": ["spend_avg_3m", "spend_avg_6m", "spend_avg_12m"],
-    "repayment_vars": ["payment_ratio_avg_3m", "payment_ratio_avg_6m", "payment_ratio_avg_12m"],
-    "card_utilization_vars": ["utilization_avg_3m", "utilization_avg_6m", "utilization_avg_12m", "utilization_max_12m"]
+data = pd.DataFrame({
+    "cust_id": [f"CUST_{i:05d}" for i in range(n_records)],
+    "max_dpd_12m": np.random.choice([0, 15, 30, 60, 90], size=n_records, p=[0.7, 0.15, 0.08, 0.05, 0.02]),
+    "utilization_avg_3m": np.random.uniform(0.0, 1.2, size=n_records),
+    "spend_avg_6m": np.random.exponential(scale=3000, size=n_records),
+    "payment_ratio_3m": np.random.uniform(0.0, 1.0, size=n_records),
+    "risk_segment": np.random.choice(["Low", "Medium", "High"], size=n_records, p=[0.6, 0.3, 0.1]),
+    "default_flag": np.random.choice([0, 1], size=n_records, p=[0.95, 0.05]) # 5% baseline rate
+})
+
+# Inject structured high-risk rules to verify engine extraction
+high_risk_mask = (data["max_dpd_12m"] >= 60) & (data["utilization_avg_3m"] >= 0.85)
+data.loc[high_risk_mask, "default_flag"] = np.random.choice([0, 1], size=high_risk_mask.sum(), p=[0.2, 0.8])
+
+# 2. Configure Domain Knowledge Feature Groups
+business_groups = {
+    "delinquency_metrics": ["max_dpd_12m", "risk_segment"],
+    "utilization_metrics": ["utilization_avg_3m"],
+    "transaction_metrics": ["spend_avg_6m", "payment_ratio_3m"]
 }
 
-# 3. Initialize the Strategic Segment Builder engine
+# 3. Define Multi-Threshold Hyperparameter Grid
+grid_config = {
+    "min_sample_size": [1000, 2500, 5000],
+    "min_lift": [2.0, 3.5, 5.0]
+}
+
+# 4. Initialize and Run the Segment Extraction Engine
 builder = StrategicSegmentBuilder(
     target="default_flag",
-    min_sample_size=1500,
-    min_lift=2.5,
+    top_n_vars=15,
+    max_segments=5,
+    max_feature_reuse=1,
     enable_diversity=True,
-    feature_groups=groups
+    feature_groups=business_groups,
+    ignore_features=["cust_id"]
 )
 
-# 4. Extract sequential segments
-segments_df = builder.extract_segments(df)
+print("Executing recursive multi-threshold segment search...")
+segments_summary = builder.extract_segments(data, param_grid=grid_config)
 
-# 5. Review the extracted production-ready rules
-print(segments_df[["segment_id", "sql_filter", "count", "lift"]])
+print("\nExtracted Segment Profiles:")
+print(segments_summary[["segment_id", "count", "lift", "meta_applied_sample_size", "sql_filter"]])
 
-# 6. Evaluate full cascading database coverage report
-coverage_df = builder.evaluate_final_coverage(df)
-print(coverage_df)
+# 5. Review Cascading Portfolio Coverage Analysis Report
+coverage_report = builder.evaluate_final_coverage(data)
+print("\nCascading Portfolio Coverage Analysis:")
+print(coverage_report)
 
+# 6. Prepare Binary Array Representation for Scorecard Tuning
+scoring_df = data[["cust_id", "default_flag"]].copy()
+
+# Map SQL filters to binary columns (1 = matches rule, 0 = otherwise)
+segment_columns = []
+for _, row in segments_summary.iterrows():
+    seg_id = row["segment_id"]
+    sql_cond = row["sql_filter"]
+    col_name = f"SEGMENT_{seg_id}"
+    
+    # Query via DuckDB to apply pure SQL strings directly to the dataframe
+    import duckdb
+    matched_ids = duckdb.query(f"SELECT cust_id FROM data WHERE {sql_cond}").df()["cust_id"]
+    scoring_df[col_name] = scoring_df["cust_id"].isin(matched_ids).astype(int)
+    segment_columns.append(col_name)
+
+# 7. Execute High-Throughput Scorecard Matrix Engine
+scorecard_engine = StrategicSegmentScore(
+    target_col="default_flag",
+    primary_key="cust_id",
+    segment_cols=segment_columns
+)
+
+print("\nCompiling scorecard weights and decile thresholds...")
+model_parameters = scorecard_engine.calculate_and_export_weights(
+    df=scoring_df, 
+    export_path="production_scorecard_model.json"
+)
+
+print("\nModel Metadata Summary:")
+print(model_parameters["model_metadata"])
+
+print("\nCalibrated Score Decile Thresholds:")
+for decile, min_score in model_parameters["decile_min_thresholds"].items():
+    print(f"Decile {decile:2s} -> Minimum Passing Score: {min_score}")
 ```
-
-```
-
-```
-

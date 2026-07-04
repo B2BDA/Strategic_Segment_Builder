@@ -1,0 +1,76 @@
+{
+    "model_metadata": {
+        "total_training_population": 50000,
+        "active_scored_population": 1262,
+        "active_population_pct": 2.52,
+        "baseline_event_rate": 0.0728
+    },
+    "segment_weights": {
+        "seg_1": {
+            "weight": 73,
+            "lift": 11.183,
+            "response_rate": 0.8146,
+            "capture_rate": 0.0338
+        },
+        "seg_2": {
+            "weight": 40,
+            "lift": 9.3872,
+            "response_rate": 0.6838,
+            "capture_rate": 0.022
+        },
+        "seg_3": {
+            "weight": 41,
+            "lift": 8.5569,
+            "response_rate": 0.6233,
+            "capture_rate": 0.025
+        },
+        "seg_4": {
+            "weight": 39,
+            "lift": 8.4709,
+            "response_rate": 0.617,
+            "capture_rate": 0.0239
+        },
+        "seg_5": {
+            "weight": 37,
+            "lift": 8.2179,
+            "response_rate": 0.5986,
+            "capture_rate": 0.0233
+        },
+        "seg_6": {
+            "weight": 17,
+            "lift": 5.6298,
+            "response_rate": 0.4101,
+            "capture_rate": 0.0157
+        },
+        "seg_7": {
+            "weight": 10,
+            "lift": 4.5047,
+            "response_rate": 0.3281,
+            "capture_rate": 0.0115
+        },
+        "seg_8": {
+            "weight": 7,
+            "lift": 4.0945,
+            "response_rate": 0.2982,
+            "capture_rate": 0.0093
+        },
+        "seg_9": {
+            "weight": 14,
+            "lift": 3.4655,
+            "response_rate": 0.2524,
+            "capture_rate": 0.0214
+        }
+    },
+    "decile_min_thresholds": {
+        "1": 73,
+        "2": 41,
+        "3": 40,
+        "4": 39,
+        "5": 21,
+        "6": 17,
+        "7": 14,
+        "8": 14,
+        "9": 10,
+        "10": 7
+    }
+}
