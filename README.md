@@ -106,8 +106,7 @@ Instead of short-circuiting early or requiring inputs to be sorted from highest 
 2. **Exhaustive Evaluation**: For each iteration, it runs the entire multi-level Apriori combination loop for every hyperparameter combination, collecting the top rule that cleared that specific experiment's floor into a master grid_candidates array.
 3. **Global Champion Resolution**: Once all experiments finish, the complete candidate table is sorted globally across all dimensions:
      ```python
-     grid_results = pd.DataFrame(grid_candidates).sort_values(
-          ["lift", "count", "rate"], ascending=False).reset_index(drop=True)
+    grid_candidates.sort(key=lambda x: (x["lift"], x["count"], x["rate"]), reverse=True)
      ```
 4. **Winning Extraction**: The record at index zero (iloc[0]) is crowned the absolute champion for that loop. The engine locks in its specific rule, updates feature usage metrics, tracks the applied parameters, and isolates the target cohort.
 ---
@@ -238,7 +237,8 @@ This guide demonstrates an end-to-end analytical pipeline: extracting rules acro
 ```python
 import numpy as np
 import pandas as pd
-from SSB_2 import StrategicSegmentBuilder, StrategicSegmentScore
+import duckdb
+from SSB import StrategicSegmentBuilder, StrategicSegmentScore
 
 # 1. Generate Synthetic Tabular Transaction Pool for Verification
 np.random.seed(42)
@@ -277,34 +277,36 @@ builder = StrategicSegmentBuilder(
     top_n_vars=15,
     max_segments=5,
     max_feature_reuse=1,
+    param_grid=grid_config,
     enable_diversity=True,
     feature_groups=business_groups,
     ignore_features=["cust_id"]
 )
 
 print("Executing recursive multi-threshold segment search...")
-segments_summary = builder.extract_segments(data, param_grid=grid_config)
+segments_summary = builder.extract_segments(data)
 
+# Convert list of dicts to DataFrame for clean terminal output profiling
+segments_df = pd.DataFrame(segments_summary)
 print("\nExtracted Segment Profiles:")
-print(segments_summary[["segment_id", "count", "lift", "meta_applied_sample_size", "sql_filter"]])
+print(segments_df[["segment_id", "count", "lift", "meta_applied_sample_size", "sql_filter"]])
 
 # 5. Review Cascading Portfolio Coverage Analysis Report
 coverage_report = builder.evaluate_final_coverage(data)
 print("\nCascading Portfolio Coverage Analysis:")
-print(coverage_report)
+print(pd.DataFrame(coverage_report))
 
 # 6. Prepare Binary Array Representation for Scorecard Tuning
 scoring_df = data[["cust_id", "default_flag"]].copy()
 
 # Map SQL filters to binary columns (1 = matches rule, 0 = otherwise)
 segment_columns = []
-for _, row in segments_summary.iterrows():
-    seg_id = row["segment_id"]
-    sql_cond = row["sql_filter"]
+for segment in segments_summary:
+    seg_id = segment["segment_id"]
+    sql_cond = segment["sql_filter"]
     col_name = f"SEGMENT_{seg_id}"
     
     # Query via DuckDB to apply pure SQL strings directly to the dataframe
-    import duckdb
     matched_ids = duckdb.query(f"SELECT cust_id FROM data WHERE {sql_cond}").df()["cust_id"]
     scoring_df[col_name] = scoring_df["cust_id"].isin(matched_ids).astype(int)
     segment_columns.append(col_name)
@@ -318,7 +320,7 @@ scorecard_engine = StrategicSegmentScore(
 
 print("\nCompiling scorecard weights and decile thresholds...")
 model_parameters = scorecard_engine.calculate_and_export_weights(
-    df=scoring_df, 
+    data=scoring_df, 
     export_path="production_scorecard_model.json"
 )
 
