@@ -4,3 +4,4 @@ prettytable
 pandas
 pyarrow
 openpyxl
+xlrd

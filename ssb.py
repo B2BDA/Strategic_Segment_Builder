@@ -18,7 +18,6 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 
 import duckdb
 import numpy as np
-import pandas as pd
 from joblib import Parallel, delayed
 from optbinning import OptimalBinning
 
@@ -48,6 +47,7 @@ class StrategicSegmentBuilder:
         top_n_vars: Number of highest-IV features passed into the Apriori engine.
         max_segments: Hard stopping ceiling for extracted mutually exclusive segments.
         max_feature_reuse: Structural limit for tracking and restricting feature dominance.
+        param_grid: Optional dictionary of parameter grid search values for min_sample_size and min_lift.
         enable_diversity: If True, blocks rules combining variables from the same business group.
         enable_1way: Allow 1-dimensional rules in final pool.
         enable_2way: Allow 2-dimensional intersection rules in final pool.
@@ -65,6 +65,7 @@ class StrategicSegmentBuilder:
         top_n_vars: int = 20,
         max_segments: int = 10,
         max_feature_reuse: int = 1,
+        param_grid: Optional[Dict[str, List[Any]]] = None,
         enable_diversity: bool = False,
         enable_1way: bool = True,
         enable_2way: bool = True,
@@ -82,7 +83,7 @@ class StrategicSegmentBuilder:
         self.max_segments = max_segments
         self.max_feature_reuse = max_feature_reuse
         self.segments: List[Dict[str, Any]] = []
-
+        self.param_grid = param_grid or {}
         self.enable_diversity = enable_diversity
         self.enable_1way = enable_1way
         self.enable_2way = enable_2way
@@ -92,9 +93,10 @@ class StrategicSegmentBuilder:
         self.feature_usage_counts: Dict[str, int] = {}
 
     @staticmethod
-    def _resolve_optb_dtype(series: pd.Series) -> str:
-        """Determines the correct OptBinning data type flag for a Pandas Series."""
-        if str(series.dtype) in ["object", "category", "string", "str"]:
+    def _resolve_optb_dtype(duckdb_type: str) -> str:
+        """Determines the correct OptBinning data type flag from a DuckDB type string."""
+        dtype_upper = duckdb_type.upper()
+        if any(t in dtype_upper for t in ["VARCHAR", "CHAR", "STRING", "TEXT", "UUID"]):
             return "categorical"
         return "numerical"
 
@@ -107,12 +109,12 @@ class StrategicSegmentBuilder:
         except ValueError:
             return False
 
-    def _validate_feature_groups(self, df: pd.DataFrame) -> None:
-        """Validates that all declared feature group variables exist in the target DataFrame."""
+    def _validate_feature_groups(self, columns: List[str]) -> None:
+        """Validates that all declared feature group variables exist in the target dataset."""
         if not self.feature_groups:
             return
 
-        active_cols = set(df.columns) - {self.target} - set(self.ignore_features)
+        active_cols = set(columns) - {self.target} - set(self.ignore_features)
         validated_count = 0
 
         for group, vars_list in self.feature_groups.items():
@@ -120,7 +122,7 @@ class StrategicSegmentBuilder:
                 if var not in active_cols:
                     raise ValueError(
                         f"Schema Mismatch: Feature '{var}' declared in group '{group}' "
-                        "was not found in the provided DataFrame."
+                        "was not found in the provided DataFrame/Table."
                     )
                 validated_count += 1
 
@@ -142,94 +144,112 @@ class StrategicSegmentBuilder:
         groups = [self.get_group(v) for v in combo]
         return len(groups) == len(set(groups))
 
-    def compute_iv_ranking(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Calculates Information Value (IV) for all eligible features."""
+    def compute_iv_ranking(self, con: duckdb.DuckDBPyConnection) -> List[Dict[str, Union[str, float]]]:
+        """Calculates Information Value (IV) for all eligible features using natively fetched numpy arrays."""
+        
+        cols_info = con.execute("DESCRIBE current_df").fetchall()
+        columns_types = {row[0]: row[1] for row in cols_info}
+        eligible_cols = [c for c in columns_types.keys() if c != self.target and c not in self.ignore_features]
+
+        # Fetch dictionary of flat NumPy arrays for fast, zero-copy serialization across joblib workers
+        data_dict = con.execute("SELECT * FROM current_df").fetchnumpy()
 
         def _worker(col: str) -> Dict[str, Union[str, float]]:
             try:
-                dtype = self._resolve_optb_dtype(df[col])
+                col_arr = data_dict[col]
+                target_arr = data_dict[self.target]
+                dtype = self._resolve_optb_dtype(columns_types[col])
+                
                 optb = OptimalBinning(name=col, dtype=dtype)
-                optb.fit(df[col].values, df[self.target].values)
-                iv_val = optb.binning_table.build().IV.iloc[-1]
+                optb.fit(col_arr, target_arr)
+                
+                # Extract IV value directly without needing a pandas import in this file
+                iv_val = optb.binning_table.build()["IV"].values[-1]
                 return {"variable": col, "iv": float(iv_val) * 100}
             except Exception as e:
                 logger.debug(f"IV computation failed for {col}: {e}")
                 return {"variable": col, "iv": 0.0}
 
-        eligible_cols = [
-            c for c in df.columns if c != self.target and c not in self.ignore_features
-        ]
         results = Parallel(n_jobs=self.n_jobs)(
             delayed(_worker)(col) for col in eligible_cols
         )
+        
+        return sorted(results, key=lambda x: x["iv"], reverse=True)
 
-        return (
-            pd.DataFrame(results)
-            .sort_values("iv", ascending=False)
-            .reset_index(drop=True)
-        )
-
-    def create_binned_df(
-        self, df: pd.DataFrame, variables: List[str]
-    ) -> pd.DataFrame:
-        """Transforms continuous data into discrete optimal binned strings."""
-        binned_df = pd.DataFrame(index=df.index)
+    def create_binned_table(self, con: duckdb.DuckDBPyConnection, variables: List[str]) -> None:
+        """Transforms continuous data into discrete optimal binned strings natively mapped in DuckDB."""
+        data_dict = con.execute("SELECT * FROM current_df").fetchnumpy()
+        binned_data = {self.target: data_dict[self.target]}
+        
+        cols_info = con.execute("DESCRIBE current_df").fetchall()
+        columns_types = {row[0]: row[1] for row in cols_info}
 
         for col in variables:
-            dtype = self._resolve_optb_dtype(df[col])
+            col_arr = data_dict[col]
+            target_arr = data_dict[self.target]
+            dtype = self._resolve_optb_dtype(columns_types[col])
+            
             optb = OptimalBinning(name=col, dtype=dtype)
-            optb.fit(df[col].values, df[self.target].values)
+            optb.fit(col_arr, target_arr)
 
-            transformed_bins = optb.transform(df[col], metric="bins")
-            binned_df[col] = pd.Categorical(transformed_bins)
+            transformed_bins = optb.transform(col_arr, metric="bins")
+            binned_data[col] = transformed_bins.astype(str)
 
-        binned_df[self.target] = df[self.target].values
-        return binned_df
+        # DuckDB resolves local dictionary variables automatically
+        con.execute("DROP TABLE IF EXISTS binned_df")
+        con.execute("CREATE TABLE binned_df AS SELECT * FROM binned_data")
 
     def _agg_combinations(
         self,
-        binned_df: pd.DataFrame,
+        con: duckdb.DuckDBPyConnection,
         combo_list: List[Tuple[str, ...]],
         base_rate: float,
-    ) -> pd.DataFrame:
-        """Parallelized aggregation testing feature combinations against thresholds."""
+    ) -> List[Dict[str, Any]]:
+        """Batch-executes SQL combinatorics via DuckDB GROUP BY to bypass slow Pandas operations."""
+        if not combo_list:
+            return []
 
-        def _process_combo(combo: Tuple[str, ...]) -> Optional[pd.DataFrame]:
-            summary = (
-                binned_df.groupby(list(combo), observed=True)
-                .agg(count=(self.target, "size"), events=(self.target, "sum"))
-                .reset_index()
-            )
+        queries = []
+        for combo in combo_list:
+            cols_str = ", ".join([f'"{c}"' for c in combo])
+            rule_concat = " || ' & ' || ".join([f"'{c}=' || CAST(\"{c}\" AS VARCHAR)" for c in combo])
+            combo_str = ",".join(combo)
+            
+            query = f"""
+                SELECT 
+                    {rule_concat} AS rule,
+                    COUNT("{self.target}")::BIGINT AS count,
+                    SUM(CAST("{self.target}" AS DOUBLE)) AS events,
+                    '{combo_str}' AS combo_vars_str
+                FROM binned_df
+                GROUP BY {cols_str}
+                HAVING COUNT("{self.target}") >= {self.min_sample_size}
+            """
+            queries.append(query)
 
-            summary = summary[summary["count"] >= self.min_sample_size].copy()
-            if summary.empty:
-                return None
+        valid_results = []
+        chunk_size = 50
+        
+        # Batch execute independent group bys natively in C++ via UNION ALL
+        for i in range(0, len(queries), chunk_size):
+            chunk = queries[i:i+chunk_size]
+            union_query = " UNION ALL ".join(chunk)
+            
+            res = con.execute(union_query).fetchall()
+            for rule, count, events, combo_vars_str in res:
+                rate = (events / count) * 100.0 if count > 0 else 0
+                lift = rate / (base_rate * 100.0) if base_rate > 0 else 0
+                
+                if lift >= self.min_lift:
+                    valid_results.append({
+                        "rule": rule,
+                        "count": count,
+                        "rate": rate,
+                        "lift": lift,
+                        "combo_vars": tuple(combo_vars_str.split(","))
+                    })
 
-            summary["rate"] = (summary["events"] / summary["count"]) * 100.0
-            summary["lift"] = summary["rate"] / (base_rate * 100.0)
-
-            summary = summary[summary["lift"] >= self.min_lift]
-            if summary.empty:
-                return None
-
-            # Optimized string join over loop concatenation
-            summary["rule"] = summary.apply(
-                lambda row: " & ".join([f"{c}={row[c]}" for c in combo]), axis=1
-            )
-            summary["combo_vars"] = [combo] * len(summary)
-
-            return summary[["rule", "count", "rate", "lift", "combo_vars"]]
-
-        results = Parallel(n_jobs=self.n_jobs)(
-            delayed(_process_combo)(c) for c in combo_list
-        )
-        valid_results = [r for r in results if r is not None]
-
-        return (
-            pd.concat(valid_results, ignore_index=True)
-            if valid_results
-            else pd.DataFrame()
-        )
+        return valid_results
 
     def parse_rule_to_sql(self, rule_str: str) -> str:
         """Translates OptBinning string syntax into a production SQL WHERE clause."""
@@ -295,25 +315,31 @@ class StrategicSegmentBuilder:
             f"({cond})" if "AND" in cond else cond for cond in sql_conditions
         )
 
-    def extract_segments(self, df: pd.DataFrame, param_grid: Optional[Dict[str, List[Any]]] = None) -> pd.DataFrame:
+    def extract_segments(self, data: Any) -> List[Dict[str, Any]]:
         """Sequentially extracts high-lift segments using an iterative Multi-Threshold Grid Search 
         while applying feature usage constraints to eliminate structural feature dominance.
         """
-        if self.enable_diversity:
-            self._validate_feature_groups(df)
+        con = duckdb.connect()
+        # DuckDB resolves local Python variables automatically (handles Pandas, Arrow, Dictionaries)
+        con.execute("CREATE TABLE current_df AS SELECT * FROM data")
 
-        current_df = df.copy()
+        cols_info = con.execute("DESCRIBE current_df").fetchall()
+        all_cols = [row[0] for row in cols_info]
+
+        if self.enable_diversity:
+            self._validate_feature_groups(all_cols)
 
         # Initialize global tracking map for tracking structural dominance
-        eligible_cols = [c for c in df.columns if c != self.target and c not in self.ignore_features]
+        eligible_cols = [c for c in all_cols if c != self.target and c not in self.ignore_features]
         self.feature_usage_counts = {col: 0 for col in eligible_cols}
+        
         # Build dynamic grid search boundaries
-        if param_grid:
+        if self.param_grid:
             logger.info(
-                f"Dynamic Grid Search Enabled: {len(param_grid.get('min_sample_size', [self.min_sample_size])) * len(param_grid.get('min_lift', [self.min_lift]))} total configurations."
+                f"Dynamic Grid Search Enabled: {len(self.param_grid.get('min_sample_size', [self.min_sample_size])) * len(self.param_grid.get('min_lift', [self.min_lift]))} total configurations."
             )
-            sizes = param_grid.get("min_sample_size", [self.min_sample_size])
-            lifts = param_grid.get("min_lift", [self.min_lift])
+            sizes = self.param_grid.get("min_sample_size", [self.min_sample_size])
+            lifts = self.param_grid.get("min_lift", [self.min_lift])
             experiments = [
                 {"min_sample_size": s, "min_lift": l}
                 for s, l in itertools.product(sizes, lifts)
@@ -322,22 +348,24 @@ class StrategicSegmentBuilder:
             experiments = [{"min_sample_size": self.min_sample_size, "min_lift": self.min_lift}]
 
         for i in range(1, self.max_segments + 1):
-            base_rate = current_df[self.target].mean()
+            res = con.execute(f'SELECT AVG("{self.target}"), COUNT(*) FROM current_df').fetchone()
+            base_rate, current_volume = res[0] or 0.0, res[1] or 0
+
             min_floor_volume = min(exp["min_sample_size"] for exp in experiments)
             
-            if base_rate == 0 or len(current_df) < min_floor_volume:
+            if base_rate == 0 or current_volume < min_floor_volume:
                 break
 
             logger.info(
-                f"Iteration {i} | Remaining Volume: {len(current_df):,} | Base Rate: {base_rate*100:.2f}%"
+                f"Iteration {i} | Remaining Volume: {current_volume:,} | Base Rate: {base_rate*100:.2f}%"
             )
 
             # 1. Recalculate Dynamic IV Ranking on residual portfolio population
-            iv_ranking = self.compute_iv_ranking(current_df)
+            iv_ranking = self.compute_iv_ranking(con)
             
             # 2. Apply Dominance Constraints: Filter out exhausted features
             allowed_vars = [
-                row["variable"] for _, row in iv_ranking.iterrows()
+                row["variable"] for row in iv_ranking
                 if self.feature_usage_counts.get(row["variable"], 0) < self.max_feature_reuse
             ]
             
@@ -346,29 +374,33 @@ class StrategicSegmentBuilder:
                 logger.warning("All eligible features have been exhausted via max_feature_reuse filters. Aborting.")
                 break
 
-            binned_df = self.create_binned_df(current_df, top_vars)
-            valid_vars = [v for v in top_vars if binned_df[v].nunique() > 1]
+            self.create_binned_table(con, top_vars)
             
-            grid_candidates: List[pd.Series] = []
+            valid_vars = []
+            for v in top_vars:
+                distinct_count = con.execute(f'SELECT COUNT(DISTINCT "{v}") FROM binned_df').fetchone()[0]
+                if distinct_count > 1:
+                    valid_vars.append(v)
+            
+            grid_candidates: List[Dict[str, Any]] = []
 
             # 3. Parameter Matrix Grid Sweep
             for config in experiments:
-                # Override parameters for joblib serialization state access rules
                 self.min_sample_size = config["min_sample_size"]
                 self.min_lift = config["min_lift"]
 
-                all_rules: List[pd.DataFrame] = []
+                all_rules: List[Dict[str, Any]] = []
 
                 # Apriori Level 1 (Singles)
                 res_1 = self._agg_combinations(
-                    binned_df, [(c,) for c in valid_vars], base_rate
+                    con, [(c,) for c in valid_vars], base_rate
                 )
                 valid_1way_vars = set()
 
-                if not res_1.empty:
-                    valid_1way_vars = {c[0] for c in res_1["combo_vars"]}
+                if res_1:
+                    valid_1way_vars = {c["combo_vars"][0] for c in res_1}
                     if self.enable_1way:
-                        all_rules.append(res_1)
+                        all_rules.extend(res_1)
 
                 if not valid_1way_vars:
                     continue
@@ -380,11 +412,11 @@ class StrategicSegmentBuilder:
                         c for c in combinations(valid_1way_vars, 2) if self.is_diverse(c)
                     ]
                     if combos_2:
-                        res_2 = self._agg_combinations(binned_df, combos_2, base_rate)
-                        if not res_2.empty:
-                            valid_2way_sets = {frozenset(c) for c in res_2["combo_vars"]}
+                        res_2 = self._agg_combinations(con, combos_2, base_rate)
+                        if res_2:
+                            valid_2way_sets = {frozenset(c["combo_vars"]) for c in res_2}
                             if self.enable_2way:
-                                all_rules.append(res_2)
+                                all_rules.extend(res_2)
 
                 # Apriori Level 3 (Triplets)
                 if self.enable_3way and len(valid_1way_vars) >= 3 and valid_2way_sets:
@@ -397,17 +429,14 @@ class StrategicSegmentBuilder:
                         )
                     ]
                     if combos_3:
-                        res_3 = self._agg_combinations(binned_df, combos_3, base_rate)
-                        if not res_3.empty:
-                            all_rules.append(res_3)
+                        res_3 = self._agg_combinations(con, combos_3, base_rate)
+                        if res_3:
+                            all_rules.extend(res_3)
 
                 if all_rules:
-                    shortlisted_config = (
-                        pd.concat(all_rules, ignore_index=True)
-                        .sort_values(["lift", "rate", "count"], ascending=False)
-                        .reset_index(drop=True)
-                    )
-                    top_match = shortlisted_config.iloc[0].copy()
+                    # Sort candidates down natively in python to avoid DataFrame serialization overhead
+                    all_rules.sort(key=lambda x: (x["lift"], x["rate"], x["count"]), reverse=True)
+                    top_match = all_rules[0].copy()
                     top_match["grid_min_sample_size"] = config["min_sample_size"]
                     top_match["grid_min_lift"] = config["min_lift"]
                     grid_candidates.append(top_match)
@@ -417,11 +446,9 @@ class StrategicSegmentBuilder:
                 break
 
             # 4. Resolve Championship Rule Across Parameter Configuration Grid Result Sets
-            grid_results = pd.DataFrame(grid_candidates).sort_values(
-                ["lift", "count", "rate"], ascending=False
-            ).reset_index(drop=True)
-
-            best_match = grid_results.iloc[0]
+            grid_candidates.sort(key=lambda x: (x["lift"], x["count"], x["rate"]), reverse=True)
+            best_match = grid_candidates[0]
+            
             best_rule = best_match["rule"]
             best_sql = self.parse_rule_to_sql(best_rule)
             winning_combo = best_match["combo_vars"]
@@ -445,16 +472,19 @@ class StrategicSegmentBuilder:
             )
 
             logger.info(f"Segment {i} Captured (Size Floor: {best_match['grid_min_sample_size']} | Lift Floor: {best_match['grid_min_lift']}): {best_sql}")
-            current_df = duckdb.query(
-                f"SELECT * FROM current_df WHERE NOT ({best_sql})"
-            ).df()
+            
+            # Execute deletion directly on the view instead of copying dataframe slices back and forth
+            con.execute(f"DELETE FROM current_df WHERE ({best_sql})")
 
-        return pd.DataFrame(self.segments)
+        return self.segments
 
-    def evaluate_final_coverage(self, original_df: pd.DataFrame) -> pd.DataFrame:
+    def evaluate_final_coverage(self, original_data: Any) -> List[Dict[str, Any]]:
         """Executes a full CASE WHEN query over the source dataset to map mutually exclusive coverage."""
         if not self.segments:
-            return pd.DataFrame()
+            return []
+            
+        con = duckdb.connect()
+        con.execute("CREATE TABLE original_df AS SELECT * FROM original_data")
 
         case_statements = [
             f"WHEN {seg['sql_filter']} THEN {seg['segment_id']}"
@@ -467,8 +497,8 @@ class StrategicSegmentBuilder:
             SELECT 
                 CASE {case_sql} ELSE 0 END AS segment, 
                 COUNT(*) AS total_count,
-                SUM("{self.target}") AS target_events,
-                (SUM("{self.target}") * 100.0 / COUNT(*)) AS response_rate
+                SUM(CAST("{self.target}" AS DOUBLE)) AS target_events,
+                (SUM(CAST("{self.target}" AS DOUBLE)) * 100.0 / COUNT(*)) AS response_rate
             FROM original_df
             GROUP BY 1
         ),
@@ -487,7 +517,11 @@ class StrategicSegmentBuilder:
         LEFT JOIN BASE_KPIS ON PER_SEG_KPIS.segment = BASE_KPIS.segment
         ORDER BY segment
         """
-        return duckdb.query(final_query).df()
+        
+        # Native return as a List of Dictionaries
+        res = con.execute(final_query)
+        columns = [desc[0] for desc in res.description]
+        return [dict(zip(columns, row)) for row in res.fetchall()]
 
 
 class StrategicSegmentScore:
@@ -506,12 +540,13 @@ class StrategicSegmentScore:
         self.model_artifact: Dict[str, Any] = {}
 
     def calculate_and_export_weights(
-        self, df: pd.DataFrame, export_path: str = "scorecard_model.json"
+        self, data: Any, export_path: str = "scorecard_model.json"
     ) -> Dict[str, Any]:
         """Calculates harmonic weights and derives decile boundaries via vectorized execution."""
-        logger.info(f"Initializing DuckDB scorecard engine for {len(df):,} records...")
+        logger.info(f"Initializing DuckDB scorecard engine...")
 
         ctx = duckdb.connect()
+        ctx.execute("CREATE TABLE df AS SELECT * FROM data")
 
         # Step 1: Baseline metrics + Vectorized multi-segment aggregation (O(1) Scan)
         agg_expressions = [
@@ -523,7 +558,7 @@ class StrategicSegmentScore:
         master_sql = f"""
             SELECT 
                 COUNT(*) AS total_pop, 
-                SUM("{self.target_col}") AS total_ev,
+                SUM(CAST("{self.target_col}" AS DOUBLE)) AS total_ev,
                 {', '.join(agg_expressions)}
             FROM df
         """
@@ -586,10 +621,16 @@ class StrategicSegmentScore:
             [weights_lookup[c]["weight"] for c in scored_cols], dtype=np.float64
         )
 
-        # df[cols] @ weights_vector runs at raw C speed
-        train_scores = (
-            df[scored_cols].to_numpy(dtype=np.float64) @ weights_vector
-        )
+        query_cols = ", ".join([f'"{c}"' for c in scored_cols])
+        
+        # Native conversion directly from DuckDB engine to NumPy arrays speeds this up exponentially
+        features_dict = ctx.execute(f"SELECT {query_cols} FROM df").fetchnumpy()
+        
+        # Construct optimized C contiguous 2D Matrix Array bypassing python loop logic
+        features_matrix = np.column_stack([features_dict[c] for c in scored_cols])
+
+        # Matrix DOT Operation performs at raw C speed
+        train_scores = features_matrix @ weights_vector
 
         logger.info(f"Dataset Zero-Inflation Rate: {zero_inflation_rate:.2%}")
 
@@ -605,7 +646,7 @@ class StrategicSegmentScore:
                 "Scorecard Failure: 0 customers triggered any segment rules."
             )
 
-        # Step 4: High-speed NumPy sorting over Pandas Series
+        # Step 4: High-speed NumPy sorting
         logger.info(
             f"Calibrating deciles across {len(active_scores):,} target customers..."
         )
