@@ -77,44 +77,96 @@ class BigQueryFeatureSelector:
         
         logger.info(f"Found {len(numerical_columns)} numerical features to evaluate.")
         return numerical_columns
+    
+    def _get_categorical_columns(self) -> List[str]:
+        """
+        Retrieves the table schema from BigQuery and extracts only the categorical columns.
 
-    def _build_sql_query(self, columns: List[str]) -> str:
+        Returns:
+            List[str]: A list of valid categorical column names, excluding the target column.
+        """
+        logger.info(f"Fetching schema for table: {self.full_table_path}")
+        table_ref = self.client.get_table(f"{self.project_id}.{self.dataset_id}.{self.table_id}")
+        
+        valid_types = {"STRING", "BOOLEAN"}
+        
+        categorical_columns = [
+            field.name 
+            for field in table_ref.schema 
+            if field.field_type in valid_types and field.name != self.target_column
+        ]
+        
+        logger.info(f"Found {len(categorical_columns)} categorical features to evaluate.")
+        return categorical_columns
+
+    def _build_sql_query(self, numerical_columns: List[str], categorical_columns: List[str]) -> str:
         """
         Constructs the dynamic parallel SQL query for variance and IV calculation.
 
         Args:
-            columns (List[str]): The list of numerical column names to process.
+            numerical_columns (List[str]): The list of numerical column names to process.
+            categorical_columns (List[str]): The list of categorical column names to process.
 
         Returns:
             str: The fully constructed executable SQL query string.
         """
         sql_parts = []
         
-        for col in columns:
+        for col in numerical_columns:
             part = f"""
-            SELECT 
-                '{col}' AS feature_name,
-                STDDEV({col}) AS feature_stddev,
-                SUM(
-                  ((goods_in_bin / NULLIF(total_goods, 0)) - (bads_in_bin / NULLIF(total_bads, 0))) * 
-                  LN((goods_in_bin / NULLIF(total_goods, 0) + 0.0001) / (bads_in_bin / NULLIF(total_bads, 0) + 0.0001))
-                ) AS naive_iv
-            FROM (
-                SELECT 
+                    SELECT 
+                    '{col}' AS feature_name,
+                    MAX(feature_stddev) AS feature_stddev,
+                    SUM(
+                    ((goods_in_bin / NULLIF(total_goods, 0)) - (bads_in_bin / NULLIF(total_bads, 0))) * LN((goods_in_bin / NULLIF(total_goods, 0) + 0.0001) / (bads_in_bin / NULLIF(total_bads, 0) + 0.0001))
+                    ) AS naive_iv
+                    FROM (
+                    SELECT 
                     bin,
                     COUNTIF({self.target_column} = 0) AS goods_in_bin,
                     COUNTIF({self.target_column} = 1) AS bads_in_bin,
                     SUM(COUNTIF({self.target_column} = 0)) OVER() AS total_goods,
-                    SUM(COUNTIF({self.target_column} = 1)) OVER() AS total_bads
-                FROM (
+                    SUM(COUNTIF({self.target_column} = 1)) OVER() AS total_bads,
+                    MAX(feature_stddev) AS feature_stddev
+                    FROM (
                     SELECT 
-                        NTILE({self.bins}) OVER(ORDER BY {col}) AS bin,
-                        {self.target_column}
+                    NTILE({self.bins}) OVER(ORDER BY {col}) AS bin,
+                    {self.target_column},
+                    STDDEV({col}) OVER() AS feature_stddev
                     FROM {self.full_table_path}
                     WHERE {col} IS NOT NULL
-                )
-                GROUP BY bin
-            )
+                    )
+                    GROUP BY bin
+                    )
+            """
+            sql_parts.append(part)
+
+        for col in categorical_columns:
+            part = f"""
+                    SELECT 
+                    '{col}' AS feature_name,
+                    MAX(feature_stddev) AS feature_stddev,
+                    SUM(
+                    ((goods_in_bin / NULLIF(total_goods, 0)) - (bads_in_bin / NULLIF(total_bads, 0))) * LN((goods_in_bin / NULLIF(total_goods, 0) + 0.0001) / (bads_in_bin / NULLIF(total_bads, 0) + 0.0001))
+                    ) AS naive_iv
+                    FROM (
+                    SELECT 
+                    bin,
+                    COUNTIF({self.target_column} = 0) AS goods_in_bin,
+                    COUNTIF({self.target_column} = 1) AS bads_in_bin,
+                    SUM(COUNTIF({self.target_column} = 0)) OVER() AS total_goods,
+                    SUM(COUNTIF({self.target_column} = 1)) OVER() AS total_bads,
+                    MAX(feature_stddev) AS feature_stddev
+                    FROM (
+                    SELECT 
+                    CAST({col} AS STRING) AS bin,
+                    {self.target_column},
+                    9999 AS feature_stddev
+                    FROM {self.full_table_path}
+                    WHERE {col} IS NOT NULL
+                    )
+                    GROUP BY bin
+                    )
             """
             sql_parts.append(part)
 
@@ -143,14 +195,15 @@ class BigQueryFeatureSelector:
             pd.DataFrame: A pandas DataFrame containing the retained features, 
                           their standard deviations, and Information Values.
         """
-        columns_to_screen = self._get_numerical_columns()
-        
-        if not columns_to_screen:
-            logger.warning("No numerical columns found to screen.")
+        numerical_columns = self._get_numerical_columns()
+        categorical_columns = self._get_categorical_columns()
+        columns_to_screen = numerical_columns + categorical_columns
+        if not numerical_columns and not categorical_columns:
+            logger.warning("No columns found to screen.")
             return pd.DataFrame()
 
-        query = self._build_sql_query(columns_to_screen)
-        
+        query = self._build_sql_query(numerical_columns, categorical_columns)
+
         logger.info("Executing distributed IV and Variance calculations in BigQuery...")
         try:
             query_job = self.client.query(query)
