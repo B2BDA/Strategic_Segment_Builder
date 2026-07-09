@@ -118,6 +118,8 @@ class BigQueryFeatureSelector:
                     '{col}' AS feature_name,
                     MAX(feature_stddev) AS feature_stddev,
                     SUM(
+                    CASE WHEN (bads_in_bin = 0 OR goods_in_bin = 0) THEN 0
+                    ELSE
                     ((goods_in_bin / NULLIF(total_goods, 0)) - (bads_in_bin / NULLIF(total_bads, 0))) * LN((goods_in_bin / NULLIF(total_goods, 0) + 0.0001) / (bads_in_bin / NULLIF(total_bads, 0) + 0.0001))
                     ) AS naive_iv
                     FROM (
