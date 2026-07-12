@@ -1,7 +1,0 @@
-optbinning
-duckdb
-prettytable
-pandas
-pyarrow
-openpyxl
-xlrd
