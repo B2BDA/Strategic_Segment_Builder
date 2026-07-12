@@ -441,7 +441,7 @@ This indicates that your segment rules are too strict and lack generalizability.
 
 **`Disable diversity constraints (enable_diversity = False)`**: This allows features within the same business category to pair up, unlocking more valid rule combinations.  
 
-# My dataset may contain target leaked feature (100% correaltion with Target). Will it be taken as important feature?
+### 4. My dataset may contain target leaked feature (100% correaltion with Target). Will it be taken as important feature?
 
 No. The feature will be dropped by Optbinning during segment creation steps.
 Furthermore, if you are using `BigQueryFeatureSelector` the feature IV will be marked as 0 and not considered. 
