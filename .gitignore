@@ -3,3 +3,6 @@ __pycache__
 *.db.wal
 *.parquet
 .venv
+*.json
+*.csv
+*.png
