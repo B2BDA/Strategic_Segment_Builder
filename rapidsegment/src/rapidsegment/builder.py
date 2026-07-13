@@ -155,8 +155,10 @@ class StrategicSegmentBuilder:
         
         def _worker(col: str) -> Tuple[str, float, Optional[np.ndarray]]:
             try:
-                data_dict = con.execute(f'SELECT "{col}", "{self.target}" FROM current_df').fetchnumpy()
-                col_arr = data_dict[col]
+                # FIX: Thread-safe cursor implementation to prevent connection corruption
+                thread_con = con.cursor()
+                data_dict = thread_con.execute(f'SELECT "{col}", "{self.target}" FROM current_df').fetchnumpy()
+		col_arr = data_dict[col]
                 target_arr = data_dict[self.target]
                 dtype = self._resolve_optb_dtype(columns_types[col])
                 
@@ -165,6 +167,8 @@ class StrategicSegmentBuilder:
                 
                 iv_val = optb.binning_table.build()["IV"].values[-1]
                 transformed_bins = optb.transform(col_arr, metric="bins").astype(str)
+                
+                thread_con.close()
                 return col, float(iv_val) * 100, transformed_bins
             except Exception as e:
                 logger.debug(f"IV computation failed for {col}: {e}")
@@ -265,13 +269,19 @@ class StrategicSegmentBuilder:
             if is_categorical and bracket_match:
                 import ast
                 try:
-                    # Safely convert the string string-representation of a list e.g. "['A', 'B']" into an actual Python list
+                    # Safely convert the string representation of a list into an actual Python list
                     raw_items = ast.literal_eval(bracket_match.group(0))
                 except Exception:
-                    # Fallback backup parsing if string structure is slightly malformed
+                    # Handle string-truncated categorical buckets (e.g. missing commas ['A' 'B'])
+                    raw_content = bracket_match.group(1)
+                    if "," not in raw_content:
+                        raw_content = re.sub(r"'\s+'", "','", raw_content)
+                        raw_content = re.sub(r'"\s+"', '","', raw_content)
+                        raw_content = re.sub(r'\s+', ',', raw_content) # Aggressive fallback
+                        
                     raw_items = [
                         i.strip().strip("'").strip('"')
-                        for i in bracket_match.group(1).split(",")
+                        for i in raw_content.split(",")
                         if i.strip()
                     ]
                 
@@ -284,12 +294,14 @@ class StrategicSegmentBuilder:
                 )
                 
                 if formatted_items:
-                    sql_conditions.append(f'{col} IN ({formatted_items})')
+                    # Clean output: No double quotes around column names
+                    sql_conditions.append(f"{col} IN ({formatted_items})")
                 continue
 
             # 2. Null/Special State Handling
             if interval in ["Special", "Missing"]:
-                sql_conditions.append(f'{col} IS NULL')
+                # Clean output: No double quotes around column names
+                sql_conditions.append(f"{col} IS NULL")
                 continue
 
             # 3. Continuous Numeric Range Handling
@@ -300,11 +312,11 @@ class StrategicSegmentBuilder:
                 range_conds = []
                 if lower_str.lower() != "-inf":
                     op = ">=" if left_char == "[" else ">"
-                    range_conds.append(f'{col} {op} {lower_str}')
+                    range_conds.append(f"{col} {op} {lower_str}")
 
                 if upper_str.lower() != "inf":
                     op = "<=" if right_char == "]" else "<"
-                    range_conds.append(f'{col} {op} {upper_str}')
+                    range_conds.append(f"{col} {op} {upper_str}")
 
                 if range_conds:
                     sql_conditions.append(" AND ".join(range_conds))
@@ -496,7 +508,8 @@ class StrategicSegmentBuilder:
                 break
 
             # 4. Resolve Championship Rule Across Parameter Configuration Grid Result Sets
-            grid_candidates.sort(key=lambda x: (x["lift"], x["count"], x["rate"]), reverse=True)
+            # FIX: Sorted primarily by volume to ensure high-lift, ultra-low-sample subsets don't override robust sets.
+            grid_candidates.sort(key=lambda x: (x["count"], x["lift"], x["rate"]), reverse=True)
             best_match = grid_candidates[0]
             
             best_rule = best_match["rule"]
