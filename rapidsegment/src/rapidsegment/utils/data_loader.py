@@ -140,8 +140,12 @@ class UniversalDataLoader:
 
     def _load_from_bigquery(self) -> Union[pa.Table, str]:
         """Resolves BigQuery ingestion using cost-optimized metadata inspection."""
+        # Explicit target definition string construction
+        project_prefix = f"{self.project_id}." if self.project_id else ""
+        full_bq_path = f"{project_prefix}{self.dataset_id}.{self.table_id}"
         try:
             from google.cloud import bigquery
+            logger.info(f"Initializing Google Cloud BigQuery Client storage stream for: {full_bq_path}")
             bq_client = bigquery.Client(project=self.project_id)
             full_table_ref = f"{self.project_id or bq_client.project}.{self.dataset_id}.{self.table_id}"
             
