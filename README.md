@@ -320,7 +320,7 @@ This guide demonstrates an end-to-end analytical pipeline: extracting rules acro
 import numpy as np
 import pandas as pd
 import duckdb
-from RapidSegment import StrategicSegmentBuilder, StrategicSegmentScore, UniversalDataLoader
+from rapidsegment import StrategicSegmentBuilder, StrategicSegmentScore, UniversalDataLoader
 
 # 1. Generate Synthetic Tabular Transaction Pool for Verification
 np.random.seed(42)
