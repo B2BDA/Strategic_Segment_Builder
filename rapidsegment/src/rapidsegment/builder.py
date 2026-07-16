@@ -238,6 +238,7 @@ class StrategicSegmentBuilder:
                         "count": count,
                         "rate": rate,
                         "lift": lift,
+                        "events": events,
                         "combo_vars": tuple(combo_vars_str.split(","))
                     })
 
@@ -520,7 +521,7 @@ class StrategicSegmentBuilder:
             # ==================================================================
             # If a micro-config (like size=10) games the system and wins the grid selection,
             # this check forcefully catches it and drops the execution line here.
-            if best_match["count"] < abs_min_sample_size or best_match["events"] < abs_min_events:
+            if (best_match["count"] < abs_min_sample_size or best_match["events"] < abs_min_events):
                 logger.warning(
                     f"Iteration {i} | Winning candidate rejected by absolute safety gate. "
                     f"Required >= {abs_min_sample_size} rows and >= {abs_min_events} events. "
