@@ -1,4 +1,4 @@
-__version__ = "1.0.0"
+__version__ = "1.1.3"
 __author__ = "Bishwarup Biswas <bishwarup1429@gmail.com>"
 
 from .utils import UniversalDataLoader
