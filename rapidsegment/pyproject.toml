@@ -1,6 +1,6 @@
 [project]
 name = "rapidsegment"
-version = "1.1.6"
+version = "1.1.7"
 description = "A fast, multi-segment population scoring and combinatorial heuristic rule extraction engine."
 readme = "README.md"
 authors = [
@@ -8,7 +8,7 @@ authors = [
 ]
 license = "MIT"
 license-files = ["LICENSE"]
-requires-python = ">=3.12"
+requires-python = ">=3.9"
 dependencies = [
     "duckdb>=1.5.4",
     "joblib>=1.5.3",
@@ -22,9 +22,8 @@ classifiers = [
     "Intended Audience :: Developers",
     "Intended Audience :: Science/Research",
     "Programming Language :: Python",
+    "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
-    "Programming Language :: Python :: 3.13",
-    "Programming Language :: Python :: 3.14",
     "Operating System :: OS Independent",
     "Topic :: Scientific/Engineering",
     "Topic :: Scientific/Engineering :: Information Analysis",
