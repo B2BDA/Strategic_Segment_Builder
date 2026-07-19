@@ -178,7 +178,55 @@ flowchart TD
     C -.-> H[Diagnostics]
     H --> I[explain_feature_journey]
 ```
+#### Flow of Input Data
+```mermaid
+---
+config:
+  theme: dark
+---
+flowchart TD
+    A["Original Data\n(input to extract_segments)"] 
+    --> B["Create current_df\n(full copy)"]
 
+    B --> C{For each segment\ni = 1 to max_segments}
+
+    C --> D[Compute base_rate & volume\non current residual current_df]
+
+    D --> E[IV Ranking + Optimal Binning\non current residual]
+
+    E --> F[Build binned_df\nusing precomputed bins from residual]
+
+    F --> G[Generate Candidates\n1-way, 2-way, 3-way on binned_df]
+
+    G --> H[Select best candidate\nby sort_priority]
+
+    H --> I["Parse rule → SQL filter\nparse_rule_to_sql()"]
+
+    I --> J[Validate on RAW current_df\nCOUNT + SUM WHERE sql_filter]
+
+    J --> K{Meets min_sample_size\nand min_events?}
+
+    K -- No --> L[Reject & Try Next Candidate\nor Stop]
+    L --> C
+
+    K -- Yes --> M[Store Segment\nwith actual counts from residual]
+
+    M --> N[Update Feature Usage Tracker]
+
+    N --> O["Delete matching rows from residual\nWHERE NOT (sql_filter) OR IS NULL"]
+
+    O --> P[current_df ← smaller residual]
+
+    P --> C
+
+    C --> Q[End Loop]
+
+    Q --> R[Return self.segments\nhierarchical rules]
+
+    subgraph Final Evaluation
+    R --> S[evaluate_final_coverage\nCASE WHEN on Original Data]
+    end
+```
 ## ⚙️ How It Works – Step by Step
 
 ### 1. Feature Ranking & Binning
